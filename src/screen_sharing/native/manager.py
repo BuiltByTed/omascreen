@@ -409,5 +409,9 @@ def main():
     app.setDesktopFileName('omascreen')
     app.theme_controller = ThemeController(app)
     window = Manager()
+    # Destroy the widget tree while Qt's event loop and Python wrappers are
+    # still alive. Leaving it to PySide's interpreter-exit cleanup can visit
+    # stale widget wrappers and crash after an otherwise successful close.
+    app.aboutToQuit.connect(window.deleteLater)
     window.show()
     return app.exec()

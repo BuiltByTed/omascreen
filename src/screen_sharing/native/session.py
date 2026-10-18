@@ -320,6 +320,7 @@ def main(argv=None):
         return 1
     app.setDesktopFileName(f"screen-sharing-{profile.id}")
     dialog = SessionDialog(profile)
+    app.aboutToQuit.connect(dialog.deleteLater)
     dialog.show()
     QTimer.singleShot(0, dialog.autoconnect)
     return app.exec()
