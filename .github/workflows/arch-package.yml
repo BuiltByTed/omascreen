@@ -30,7 +30,7 @@ jobs:
             -v "$PWD/omarchy-builder/build-output/edge/x86_64:/packages:ro" \
             -v "$PWD/packaging/omarchy:/checks:ro" \
             omarchy-pkg-builder:latest-x86_64-edge \
-            bash -euc 'sudo pacman -U --noconfirm /packages/*.pkg.tar.zst; QT_QPA_PLATFORM=offscreen python /checks/smoke-installed.py'
+            bash /checks/smoke-installed.sh
       - uses: actions/upload-artifact@v7
         with:
           name: omascreen-arch-x86_64
