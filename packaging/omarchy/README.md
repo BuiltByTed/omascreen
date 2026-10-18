@@ -32,7 +32,9 @@ The build requires a working Docker or Podman installation. It builds each recip
 in an isolated container and stages dependencies for later packages. Output is
 under `build-output/edge/x86_64/`. A plan-only check uses `--dry-run`; that is not
 a successful build. Omascreen's [Arch packages workflow](../../.github/workflows/arch-package.yml)
-runs this same builder on GitHub and uploads the resulting packages.
+runs this same builder on GitHub, installs the packages into a fresh container,
+checks the command, launcher, VNC dependency and GUI shutdown, and uploads the
+resulting packages.
 
 Check release discovery with:
 
