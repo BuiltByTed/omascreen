@@ -1,0 +1,77 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "omascreen"
+version = "0.3.0"
+description = "Native Omarchy connection manager for Apple Screen Sharing and VNC"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [{ name = "Theodore Charles" }, { name = "renegadelink and contributors" }]
+keywords = ["screen-sharing", "vnc", "macos", "hevc", "srtp", "remote-desktop"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Video",
+    "Topic :: System :: Networking",
+]
+dependencies = [
+    # Core protocol + media
+    "cryptography>=42.0",
+    "pycryptodome>=3.20",
+    "av>=12.0",
+    "numpy>=1.26",
+    "PySide6-Essentials>=6.8",
+    "keyring>=25.0",
+    "dnspython>=2.6",
+    "tomli>=2; python_version < '3.11'",
+    # Native desktop viewer (wgpu + glfw native window)
+    "wgpu>=0.31",
+    "rendercanvas>=2.6",
+    "glfw>=2.10",
+    # Audio playback (PortAudio bindings)
+    "sounddevice>=0.5",
+    # Cross-platform clipboard read/write. On macOS uses pbcopy/pbpaste,
+    # on Windows uses native ctypes Win32 (no PowerShell startup), on
+    # Linux X11 falls back to xclip/xsel and on GNOME-Wayland uses
+    # GPaste D-Bus (else wl-clipboard).
+    "pyperclip>=1.9",
+    # macOS: native VideoToolbox HEVC decode path (src/.../media/vtdecode.py).
+    # VideoToolbox manages the DPB the way Apple's own viewer does, avoiding
+    # libav's hwaccel DPB mismanagement that periodically wedges the stream.
+    # Other platforms use the libav `av` decoder; these are darwin-only.
+    "pyobjc-framework-VideoToolbox>=10.0; sys_platform == 'darwin'",
+    "pyobjc-framework-CoreMedia>=10.0; sys_platform == 'darwin'",
+    "pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'",
+]
+
+[project.optional-dependencies]
+# Local test suite — fast, deterministic unit tests that need no remote host,
+# no real decode and no network. `pip install -e .[test]` then `pytest`.
+test = ["pytest>=8"]
+
+[project.scripts]
+omascreen = "screen_sharing.entry:main"
+screen-sharing = "screen_sharing.entry:main"
+
+[project.urls]
+Homepage = "https://github.com/BuiltByTed/omascreen"
+Issues = "https://github.com/BuiltByTed/omascreen/issues"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/screen_sharing"]

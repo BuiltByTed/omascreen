@@ -1,0 +1,325 @@
+"""Native sign-in/progress window for a single saved Mac; no browser or manager."""
+import argparse
+from collections import deque
+from dataclasses import replace
+import os
+from pathlib import Path
+import sys
+
+from PySide6.QtCore import QEvent, QProcess, QProcessEnvironment, QSize, QTimer, Qt
+from PySide6.QtGui import QFont, QIcon, QPixmap
+from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QHBoxLayout, QLabel,
+                              QLineEdit, QMessageBox, QProgressBar, QPushButton,
+                              QVBoxLayout, QWidget)
+
+from . import credentials
+from .commands import find
+from .profiles import ProfileStore, session_arguments
+from .shortcuts import profile_icon, shortcut_path, create as create_shortcut
+from .theme import ThemeController
+from ..proxy.liveness import RECONNECT_EXIT_CODE
+
+
+class SessionDialog(QDialog):
+    def __init__(self, profile):
+        super().__init__()
+        self.profile = profile
+        self.process = None
+        self.cancelled = False
+        self.ready = False
+        self.secret = None
+        # Keep the active session credential in memory for reconnect, whether
+        # or not the user chose to persist it in the OS keyring.
+        self._session_password = None
+        self.reconnecting = False
+        self.retry_attempt = 0
+        self.retry_timer = QTimer(self)
+        self.retry_timer.setSingleShot(True)
+        self.retry_timer.timeout.connect(self._start_session)
+        self.icon_fetcher = None
+        self.logs = deque(maxlen=100)
+        self.output = ""
+        self.setWindowTitle(f"{profile.name} — Omascreen")
+        self.setWindowIcon(QIcon(str(profile_icon(profile))))
+        self.setFixedWidth(440)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(28, 24, 28, 24)
+        layout.setSpacing(16)
+        artwork = self.artwork = QLabel()
+        artwork.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.update_artwork()
+        layout.addWidget(artwork)
+        name = QLabel(profile.name)
+        name.setTextFormat(Qt.TextFormat.PlainText)
+        name.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        font = name.font()
+        font.setPointSize(19)
+        font.setWeight(QFont.Weight.DemiBold)
+        name.setFont(font)
+        layout.addWidget(name)
+        self.status = QLabel(f"Sign in as {profile.username}")
+        self.status.setTextFormat(Qt.TextFormat.PlainText)
+        self.status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+        self.form = QWidget()
+        form = QVBoxLayout(self.form)
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(12)
+        self.password = QLineEdit()
+        self.password.setPlaceholderText("Mac password")
+        self.password.setAccessibleName("Mac password")
+        self.password.setEchoMode(QLineEdit.EchoMode.Password)
+        self.password.setMinimumHeight(36)
+        form.addWidget(self.password)
+        self.remember = QCheckBox("Remember in system keyring")
+        self.remember.setEnabled(credentials.available())
+        self.remember.setChecked(profile.remember_password and self.remember.isEnabled())
+        if not self.remember.isEnabled():
+            self.remember.setToolTip("A Secret Service or KWallet keyring is needed to save passwords.")
+        form.addWidget(self.remember)
+        layout.addWidget(self.form)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)
+        self.progress.setTextVisible(False)
+        self.progress.setFixedHeight(4)
+        self.progress.hide()
+        layout.addWidget(self.progress)
+        hint = QLabel("Ctrl+Alt+Enter  ·  Fullscreen\nCtrl+Alt+Escape  ·  Disconnect")
+        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        hint.setForegroundRole(self.palette().ColorRole.PlaceholderText)
+        layout.addWidget(hint)
+        footer = QHBoxLayout()
+        mode = QLabel("Fullscreen" if profile.fullscreen else "Windowed")
+        mode.setForegroundRole(self.palette().ColorRole.PlaceholderText)
+        footer.addWidget(mode)
+        footer.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        footer.addWidget(cancel)
+        self.connect_button = QPushButton("Connect")
+        self.connect_button.setDefault(True)
+        self.connect_button.clicked.connect(self.connect_session)
+        self.connect_button.setEnabled(False)
+        self.password.textChanged.connect(lambda text: self.connect_button.setEnabled(bool(text)))
+        footer.addWidget(self.connect_button)
+        layout.addLayout(footer)
+        self.password.setFocus()
+
+    def update_artwork(self):
+        self.artwork.setPixmap(QIcon(str(profile_icon(self.profile))).pixmap(
+            QSize(136, 136), self.devicePixelRatioF()))
+
+    def event(self, event):
+        result = super().event(event)
+        if event.type() in (QEvent.Type.DevicePixelRatioChange, QEvent.Type.Show) and hasattr(self, "artwork"):
+            self.update_artwork()
+        return result
+
+    def autoconnect(self):
+        if not self.profile.remember_password:
+            return
+        try:
+            password = credentials.get(self.profile.id)
+            if password:
+                self.password.setText(password)
+                self.connect_session()
+        except Exception:
+            self.status.setText("Unlock your keyring or enter your Mac password.")
+
+    def connect_session(self):
+        if self.process is not None:
+            return
+        password = self.password.text()
+        if not password or "\n" in password or "\r" in password:
+            return
+        self.secret = password if self.remember.isChecked() else None
+        self._session_password = password
+        self.cancelled = self.reconnecting = False
+        self.retry_attempt = 0
+        self._start_session()
+        self.password.clear()
+
+    def _start_session(self):
+        if self.cancelled or self.process is not None or not self._session_password:
+            return
+        self.ready = False
+        self.logs.clear()
+        self.output = ""
+        self.form.hide()
+        self.progress.show()
+        self.connect_button.hide()
+        self.status.setText("Reconnecting…" if self.reconnecting else "Connecting…")
+        self.process = QProcess(self)
+        process = self.process
+        env = QProcessEnvironment.systemEnvironment()
+        env.insert("PYTHONUNBUFFERED", "1")
+        env.insert("SCREEN_SHARING_CTRL_AS_CMD", "1" if self.profile.ctrl_as_cmd else "0")
+        env.insert("SCREEN_SHARING_GRAB_KEYBOARD", "1" if self.profile.grab_keyboard else "0")
+        env.insert("SCREEN_SHARING_APP_ID", f"screen-sharing-{self.profile.id}")
+        env.insert("SCREEN_SHARING_MACHINE", self.profile.machine)
+        # Qt may inject its library/plugin paths; the viewer owns GLFW, not Qt.
+        for key in ("QT_QPA_PLATFORM_PLUGIN_PATH", "QT_QPA_FONTDIR"):
+            env.remove(key)
+        process.setProcessEnvironment(env)
+        process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        process.readyReadStandardOutput.connect(self.read_output)
+        process.finished.connect(self.process_finished)
+        process.errorOccurred.connect(self.process_error)
+        process.start(sys.executable, session_arguments(self.profile, None))
+        process.write((self._session_password + "\n").encode())
+        process.closeWriteChannel()
+
+    def read_output(self):
+        if not self.process:
+            return
+        self.output += bytes(self.process.readAllStandardOutput()).decode("utf-8", errors="replace")
+        # Bound partial lines as well as the diagnostic tail.
+        self.output = self.output[-32768:]
+        lines = self.output.split("\n")
+        self.output = lines.pop()
+        for line in lines:
+            if line == "SCREEN_SHARING_VIEWER_READY":
+                self.viewer_ready()
+            else:
+                self.logs.append(line)
+
+    def viewer_ready(self):
+        if self.ready:
+            return
+        self.ready = True
+        self.reconnecting = False
+        self.retry_attempt = 0
+        self.hide()
+        if (self.profile.fetch_icon and self.profile.icon_mode in ('online', 'mac')
+                and not (self.profile.fetched_icon and Path(self.profile.fetched_icon).is_file())
+                and self.icon_fetcher is None):
+            from .icons import IconFetch
+            self.icon_fetcher = IconFetch(self)
+            self.icon_fetcher.finished.connect(self._icon_fetched)
+            self.icon_fetcher.start(self.profile)
+        if self.secret is not None:
+            try:
+                credentials.save(self.profile.id, self.secret)
+                profiles = ProfileStore().load()
+                ProfileStore().save([replace(p, remember_password=True) if p.id == self.profile.id else p for p in profiles])
+            except Exception as error:
+                QMessageBox.warning(self, "Password not saved", str(error))
+            finally:
+                self.secret = None
+
+    def _icon_fetched(self, path, error):
+        if not path:
+            return  # optional metadata must never interrupt a remote session
+        try:
+            store = ProfileStore()
+            profiles = store.load()
+            current = next(p for p in profiles if p.id == self.profile.id)
+            if (current.host, current.ssh_host, current.username) != (
+                    self.profile.host, self.profile.ssh_host, self.profile.username):
+                return
+            self.profile = replace(current, fetched_icon=path)
+            store.save([self.profile if p.id == current.id else p for p in profiles])
+            if shortcut_path(current).exists():
+                create_shortcut(self.profile)
+            self.update_artwork()
+        except (OSError, ValueError, StopIteration):
+            pass
+
+    def process_error(self, error):
+        if error == QProcess.ProcessError.FailedToStart:
+            self.process_finished(1, QProcess.ExitStatus.CrashExit)
+
+    def process_finished(self, code, exit_status):
+        self.read_output()
+        if self.process:
+            self.process.deleteLater()
+            self.process = None
+        normal_exit = exit_status == QProcess.ExitStatus.NormalExit
+        if self.cancelled or (normal_exit and code == 0):
+            self.retry_timer.stop()
+            self.secret = self._session_password = None
+            QApplication.instance().quit()
+            return
+        if (normal_exit and self._session_password is not None
+                and (code == RECONNECT_EXIT_CODE or (self.reconnecting and code == 1))):
+            self.reconnecting = True
+            self.retry_attempt += 1
+            delay = min(2 ** min(self.retry_attempt - 1, 4), 15)
+            self.status.setText(f"Connection interrupted. Reconnecting in {delay}s…")
+            self.form.hide()
+            self.connect_button.hide()
+            self.progress.show()
+            self.show()
+            self.retry_timer.start(delay * 1000)
+            return
+        self.retry_timer.stop()
+        self.reconnecting = False
+        self.secret = self._session_password = None
+        self.progress.hide()
+        self.form.show()
+        self.connect_button.show()
+        self.connect_button.setText("Retry")
+        self.connect_button.setEnabled(False)
+        if code == 2:
+            message = (f"Sign-in failed for {self.profile.username}. "
+                       "Check your Mac login password and that this account "
+                       "has Screen Sharing access.")
+        elif self.ready:
+            message = "The connection ended. Enter your password to reconnect."
+        else:
+            message = "Couldn’t connect. Check that the Mac is reachable and Screen Sharing is enabled."
+        self.status.setText(message)
+        # Diagnostic text remains local and is available on stderr when run from a terminal.
+        if sys.stderr:
+            print("\n".join(self.logs), file=sys.stderr)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.password.setFocus()
+
+    def reject(self):
+        self.cancelled = True
+        self.retry_timer.stop()
+        self.secret = self._session_password = None
+        self.password.clear()
+        if self.process is not None:
+            self.process.terminate()
+            process = self.process
+            QTimer.singleShot(1500, lambda: process.kill() if self.process is process and process.state() != QProcess.ProcessState.NotRunning else None)
+            self.status.setText("Disconnecting…")
+        else:
+            QApplication.instance().quit()
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="omascreen --app")
+    parser.add_argument("connection")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--fullscreen", action="store_true", default=None)
+    mode.add_argument("--windowed", dest="fullscreen", action="store_false")
+    args = parser.parse_args(argv)
+    app = QApplication.instance() or QApplication(["omascreen"])
+    app.setApplicationName("Omascreen")
+    app.theme_controller = ThemeController(app)
+    app.setQuitOnLastWindowClosed(False)
+    try:
+        profile = find(ProfileStore().load(), args.connection)
+        if args.fullscreen is not None:
+            profile = replace(profile, fullscreen=args.fullscreen)
+        if profile.protocol == 'auto':
+            from .mode_select import choose_mode
+            profile = choose_mode(profile)
+            if profile is None:
+                return 0
+        if profile.protocol == "vnc":
+            from .vnc import launch
+            return launch(profile)
+    except (OSError, ValueError, RuntimeError) as error:
+        QMessageBox.critical(None, "Omascreen", str(error))
+        return 1
+    app.setDesktopFileName(f"screen-sharing-{profile.id}")
+    dialog = SessionDialog(profile)
+    dialog.show()
+    QTimer.singleShot(0, dialog.autoconnect)
+    return app.exec()

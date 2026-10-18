@@ -1,0 +1,13 @@
+Omascreen
+
+Derived from the Apple Screen Sharing client by renegadelink and contributors.
+Upstream: https://github.com/renegadelink/iShareScreen
+Adapted from https://github.com/theodorecharles/screen-sharing at 491b82e,
+with native GUI, CLI, desktop integration and recovery changes by Theodore Charles.
+This repository begins with an attributed source snapshot; earlier source history
+is available from the repositories above.
+Distributed under AGPL-3.0-or-later; see LICENSE.
+
+Lucide artwork is separately licensed; see src/screen_sharing/native/assets/LICENSE-lucide.
+No Apple device artwork is distributed. Optional downloads remain in the user's
+local cache and are not covered by this project's code license.
