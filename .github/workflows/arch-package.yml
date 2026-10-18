@@ -1,0 +1,31 @@
+name: Arch packages
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'packaging/omarchy/**'
+      - '.github/workflows/arch-package.yml'
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check out Omarchy's package builder
+        uses: actions/checkout@v7
+        with:
+          repository: omacom/omarchy-pkgs
+          ref: 914afbff9505fca70c276487c9d5366c400402ec
+          path: omarchy-builder
+      - name: Add recipes
+        run: cp -a packaging/omarchy/pkgbuilds/. omarchy-builder/pkgbuilds/
+      - name: Build in isolated Omarchy Arch containers
+        working-directory: omarchy-builder
+        run: bin/build --package python-rendercanvas python-glfw python-wgpu omascreen
+      - uses: actions/upload-artifact@v7
+        with:
+          name: omascreen-arch-x86_64
+          path: omarchy-builder/build-output/edge/x86_64/*.pkg.tar.zst
+          if-no-files-found: error

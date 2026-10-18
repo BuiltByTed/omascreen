@@ -71,18 +71,17 @@ and accepted packages in the
 [Omarchy Package Repository](https://github.com/omacom/omarchy-pkgs) become
 installable with its normal package command.
 
-The publication route is:
+The publication route is a direct contribution to `omacom/omarchy-pkgs`; an
+AUR listing is **not required**. Proposed recipes for Omascreen and its missing
+Python dependencies are in [packaging/omarchy](../packaging/omarchy/README.md).
+They use pinned release downloads, checksums, and release-watch metadata.
 
-1. Package Omascreen and its Python dependencies in Arch PKGBUILDs. In particular,
-   `wgpu`, `rendercanvas`, and the Python GLFW bindings need dependency recipes
-   or an agreed packaging strategy; the source installer currently gets these
-   from Python's package index.
-2. Verify builds in clean Arch environments and publish the recipes to AUR.
-   Only after publication would `omarchy pkg aur add omascreen` work.
-3. Submit a reviewed package to `omacom/omarchy-pkgs`, including a pinned source,
-   checksums, and its `.omarchy/package.json` update metadata. Acceptance and
-   build approval are controlled by the Omarchy maintainers. Only after that
-   would `omarchy pkg add omascreen` work.
+Build and test the recipes in Omarchy's isolated container builder, then submit
+one package per PR, dependencies first. New contributors need a maintainer to
+approve CI builds. Accepted packages publish to `edge`; later promotion makes
+them available on `rc` and `stable`. Python packages use this normal release
+process rather than the fast ring.
 
-Publishing the GitHub repository alone does not register the package in either
-catalog. Until those packaging steps are completed, use the installer above.
+An AUR release is a separate, optional distribution route. Publishing the GitHub
+repository or adding recipes there does not register a package in either catalog.
+Until Omarchy accepts and publishes it in your channel, use the source installer.
