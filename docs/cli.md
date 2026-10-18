@@ -89,7 +89,7 @@ its own authentication for standard VNC.
 
 ```sh
 omascreen session --host studio.local --user mac-user --fullscreen
-omascreen session --host studio.local --user mac-user --headless --auto-quit-secs 10
+omascreen session --host studio.local --user mac-user --headless --auto-quit-secs 30
 omascreen session --help
 omascreen --list-decoders
 omascreen --version

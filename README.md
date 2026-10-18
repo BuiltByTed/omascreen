@@ -91,7 +91,7 @@ suspend/timeout detection, reconnect process behavior, credentials, profiles,
 launchers, the native editor, icon downloads, and credential-free RFB detection.
 It uses fake network peers and processes; physical sleep/wake and real remote
 servers require live testing. The low-level command also supports
-`--headless --auto-quit-secs 10` for a short live protocol test.
+`--headless --auto-quit-secs 30` for a short live protocol test.
 
 ## License
 

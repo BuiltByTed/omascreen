@@ -110,7 +110,9 @@ def fetch_icon(profile):
 def import_icon(profile, path):
     """Copy a selected image into managed storage, normalized to PNG."""
     from PySide6.QtCore import QBuffer, QByteArray, QIODevice, Qt
-    from PySide6.QtGui import QImageReader
+    from PySide6.QtGui import QGuiApplication, QImageReader
+    # SVG text needs a font database even when importing through a headless CLI.
+    application = QGuiApplication.instance() or QGuiApplication(['omascreen', '-platform', 'offscreen'])
     profile.validate()
     reader = QImageReader(str(path))
     size = reader.size()

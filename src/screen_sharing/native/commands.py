@@ -133,7 +133,7 @@ def main(argv=None):
             store.save([other for other in profiles if other.id != profile.id])
             print(f"Removed {profile.name}.")
         elif args.command == "password":
-            if profile.protocol == 'vnc':
+            if profile.protocol == 'vnc' and not args.forget:
                 raise ValueError('Standard VNC credentials are managed by TigerVNC in its connection window.')
             if args.forget:
                 credentials.remove(profile.id)
