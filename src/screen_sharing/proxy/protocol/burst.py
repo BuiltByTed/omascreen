@@ -22,6 +22,7 @@ from ..media.nalu import IDR_RANGE, NAL_PPS, NAL_SPS, NAL_VPS, reassemble_group
 from ..media.avc_nalu import (
     APPLE_CONFIG_MARKER, NAL_SLICE_IDR, parse_avc_config, reassemble_h264)
 from .srtp import SRTPDecryptor
+from .rtp import sort_rtp_packets
 
 
 log = logging.getLogger(__name__)
@@ -119,7 +120,9 @@ def gather_initial_burst(
             seq = struct.unpack(">H", hdr[2:4])[0]
             ts = struct.unpack(">I", hdr[4:8])[0]
             marker = bool(hdr[1] & 0x80)
-            ssrc_ts_groups[(ssrc, ts)].append((seq, marker, payload))
+            group = ssrc_ts_groups[(ssrc, ts)]
+            if not any(packet[0] == seq for packet in group):
+                group.append((seq, marker, payload))
         processed = len(snap)
 
         _refresh_ssrc_map()
@@ -138,13 +141,14 @@ def gather_initial_burst(
                 completed.add(key)
                 continue
 
-            # Sort by seq with wraparound awareness.
-            seqs = [s for s, _, _ in grp]
-            if seqs and max(seqs) - min(seqs) > 0x8000:
-                base = min(seqs)
-                packets = sorted(grp, key=lambda x: (x[0] - base) & 0xFFFF)
-            else:
-                packets = sorted(grp, key=lambda x: x[0])
+            # Apply the same ordering and repair rules as the live receiver.
+            # A marker alone does not make a damaged initial keyframe safe.
+            packets = sort_rtp_packets(grp)
+            if not packets[-1][1] or any(
+                ((packets[i + 1][0] - packets[i][0]) & 0xFFFF) > 1
+                for i in range(len(packets) - 1)
+            ):
+                continue  # retain for the live NACK/repair window
 
             for _s, _t, _p in packets:
                 if _p:

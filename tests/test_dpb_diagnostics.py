@@ -103,10 +103,12 @@ def test_dpb_log_arms_decoder_even_while_fir_fast_path_is_cooling_down(
     """Decoder gating is immediate; only the outbound FIR is rate-limited."""
     gate = FrameQualityGate(1)
     armed: list[str] = []
+    concealed: list[str] = []
     session = Session.__new__(Session)
     session._decoder = types.SimpleNamespace(
         _gate=gate,
         mark_reference_chain_broken=armed.append,
+        mark_decode_concealment=concealed.append,
     )
     session._observed_tile_count = 1
     session._dpb_error_window = __import__("collections").deque()
@@ -122,6 +124,7 @@ def test_dpb_log_arms_decoder_even_while_fir_fast_path_is_cooling_down(
     session._on_libav_concealment(msg)
 
     assert armed == [msg]
+    assert concealed == [msg]
     # No second fast-path FIR was armed inside the one-second cooldown.
     assert gate._keyframe_required == set()
     assert session._dpb_fir_count == 1

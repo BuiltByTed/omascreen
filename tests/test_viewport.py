@@ -43,3 +43,15 @@ def test_renderer_and_cursor_use_the_centered_viewport():
     # Pointer at content center must also land at viewport/window center.
     assert buffers[-1][0] == pytest.approx(0)
     assert buffers[-1][1] == pytest.approx(0)
+
+
+def test_resize_frame_cannot_overrun_the_previous_canvas():
+    from screen_sharing.frontend.desktop.gpu import Renderer
+    from screen_sharing.proxy.media.tiles import TileFrame
+
+    renderer = Renderer.__new__(Renderer)
+    renderer._w, renderer._h = 1920, 1080
+    # The Mini reproduced this transition during a live connection. No device
+    # is installed here: an incompatible frame must stop before any GPU call.
+    frame = TileFrame(b"", b"", b"", 2832, 432, 2832, 2832, 2832, 432)
+    renderer.upload_tile(0, frame, 432)

@@ -52,6 +52,7 @@ from .media.quality_gate import TileVisState
 from .. import __version__ as _iss_version
 from .control import ControlServer
 from .protocol.burst import BurstStarved, InitialBurst, gather_initial_burst
+from .protocol.rtp import sort_rtp_packets
 from .protocol.negotiation import (
     AdvertiseDims,
     NegotiationResult,
@@ -1028,8 +1029,12 @@ class Session:
         # without a clash — the ports stay default (they're symmetric with the
         # server's), only the local interface narrows.
         bind_host = cfg.udp_bind_host or os.environ.get("SCREEN_SHARING_UDP_BIND_HOST", "")
-        self._sock_ctrl = self._bind_udp(bind_host, ctrl_port)
-        self._sock_video = self._bind_udp(bind_host, video_port)
+        self._sock_ctrl = self._bind_udp(
+            bind_host, ctrl_port, peer=(self._dest_host, ctrl_port),
+        )
+        self._sock_video = self._bind_udp(
+            bind_host, video_port, peer=(self._dest_host, video_port),
+        )
         # Tap the media sockets so SRTP RTP/RTCP (and our heartbeats /
         # firewall punches) land in the capture alongside the TCP control
         # stream. The tap is a transparent proxy — every other socket call
@@ -1446,7 +1451,10 @@ class Session:
         return gather_initial_burst(
             burst_buf, self._video_decryptor, quality_tier=cfg.quality_tier,
             codec=self._video_codec,
-            min_packets=400 if _is_avc else 100,
+            # The socket drain has finished; this is a fixed snapshot with
+            # no producer. Waiting for a packet floor or settling here cannot
+            # collect any more data and added 2.3 s to static AVC desktops.
+            min_packets=0, settle_seconds=0,
         )
 
     def _teardown_negotiation_tcp(self) -> None:
@@ -2025,6 +2033,13 @@ class Session:
             return
         now = time.monotonic()
 
+        # Keep log-only concealment attached to the AU being decoded. This
+        # hook is separate from transport-loss recovery, which runs on the
+        # receive thread and cannot attribute an error to a decoder's PTS.
+        mark_concealment = getattr(self._decoder, "mark_decode_concealment", None)
+        if callable(mark_concealment):
+            mark_concealment(msg)
+
         # Track sustained reference-missing events. Threshold breach means real
         # corruption that won't self-heal before the next natural IDR cycle.
         # "could not find ref" is libav-HEVC's ref-miss signature; the AVC path
@@ -2275,6 +2290,11 @@ class Session:
                 pkt, _addr = sock.recvfrom(65536)
             except socket.timeout:
                 continue
+            except (ConnectionRefusedError, ConnectionResetError):
+                # A handshake firewall punch may reach the Mac before its
+                # media port opens. Connected UDP surfaces the ICMP reply;
+                # it must not permanently stop this session's receiver.
+                continue
             except OSError:
                 return
             self._rx_pkts_video += 1
@@ -2353,21 +2373,7 @@ class Session:
     @staticmethod
     def _sorted_group_packets(grp: list[_PktTuple]) -> list[_PktTuple]:
         """Sequence-order one timestamp group, including 65535→0 wrap."""
-        packets = sorted(grp, key=lambda x: x[0])
-        if len(packets) < 2 or packets[-1][0] - packets[0][0] <= 0x8000:
-            return packets
-
-        # Start immediately after the largest circular gap. This remains
-        # correct when several packets precede wrap (e.g. 65534,65535,0,1);
-        # choosing either min or max as the anchor misorders one of those
-        # perfectly ordinary cases.
-        gaps = [
-            ((packets[(i + 1) % len(packets)][0] - packet[0]) & 0xFFFF, i)
-            for i, packet in enumerate(packets)
-        ]
-        _, gap_idx = max(gaps)
-        start = (gap_idx + 1) % len(packets)
-        return packets[start:] + packets[:start]
+        return sort_rtp_packets(grp)
 
     def _group_complete(self, key: tuple[int, int], grp: list[_PktTuple]) -> bool:
         """True when marker boundaries and the AU's sequence range are intact."""
@@ -2974,6 +2980,8 @@ class Session:
                 pkt, _addr = sock.recvfrom(65536)
             except socket.timeout:
                 continue
+            except (ConnectionRefusedError, ConnectionResetError):
+                continue  # transient ICMP response to an early firewall punch
             except OSError:
                 return
             self._rx_pkts_ctrl += 1
@@ -4504,7 +4512,9 @@ class Session:
             stop.wait(0.1)
 
     @staticmethod
-    def _bind_udp(host: str, port: int) -> socket.socket:
+    def _bind_udp(
+        host: str, port: int, *, peer: Optional[tuple[str, int]] = None,
+    ) -> socket.socket:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         # Big rmem so the burst doesn't get dropped before we drain it.
@@ -4512,7 +4522,17 @@ class Session:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
         except OSError:
             pass
-        s.bind((host, port))
+        try:
+            s.bind((host, port))
+            if peer is not None:
+                # Every Mac uses the same symmetric media ports. Connecting
+                # the UDP socket lets the kernel select by remote IP/port as
+                # well as local port: a second session must not steal the
+                # first session's unicast media through SO_REUSEADDR.
+                s.connect(peer)
+        except BaseException:
+            s.close()
+            raise
         return s
 
     @staticmethod
@@ -4579,6 +4599,8 @@ class Session:
                 if into:
                     return
                 continue
+            except (ConnectionRefusedError, ConnectionResetError):
+                continue  # Mac media port may still be opening after a punch
             except OSError:
                 return
             into.append(pkt)

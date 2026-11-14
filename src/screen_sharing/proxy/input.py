@@ -80,9 +80,10 @@ def _build_msg10_pointer(
 class InputController:
     """Thread-safe wrapper around the RFB control socket.
 
-    All three event methods are non-blocking from the caller's perspective and
-    swallow per-call socket errors — a stale socket during hot reconnect must
-    not propagate up into the render loop. Resolution is only used to clamp
+    Event methods contain socket errors so a stale socket during reconnect
+    does not propagate up into the render loop. A failed encrypted send closes
+    this controller and shuts down TCP through the cipher, requesting a fresh
+    session instead of continuing a potentially partial record. Resolution clamps
     out-of-range pointer coordinates; accurate clamping prevents wrap-around
     bugs in the macOS pointer handler.
     """
@@ -231,4 +232,8 @@ class InputController:
                     self._sock.sendall(payload)
                 self.tx_pkts += 1
             except OSError as e:
-                log.debug("input send dropped: %s", e)
+                if self._cipher is not None:
+                    self._closed = True
+                    log.warning("control input send failed; reconnecting: %s", e)
+                else:
+                    log.debug("input send dropped: %s", e)

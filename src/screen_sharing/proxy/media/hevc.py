@@ -57,6 +57,7 @@ from .decode_common import (
     _TileSlot,
     _HW_FRAME_FORMATS,
     _av_frame_to_tile,
+    _frame_has_decode_error,
 )
 
 
@@ -253,6 +254,8 @@ class HevcDecoder:
         self._next_pts = 0
         self._pts_to_tile: dict[int, int] = {}
         self._pts_submit_t: dict[int, float] = {}
+        self._decoding_pts: Optional[int] = None
+        self._concealed_pts: set[int] = set()
         self._decode_latency_ms: float = 0.0
         self._eagain_streak = 0
         # Session-wide IDR seen since last decoder reset. Cross-tile DPB
@@ -490,9 +493,8 @@ class HevcDecoder:
         """Return the latest decoded frame for `tile_idx`, or None.
 
         Returns None when (a) there's no new frame since the last call,
-        (b) the shared codec context hasn't yet decoded any IDR (output
-        before that is concealment fill from a cold DPB), or (c) the
-        legacy heuristic gate (if enabled) blocked the frame.
+        (b) the shared codec context hasn't yet decoded any IDR, or (c)
+        PyAV or the libav log callback reported corruption for this frame.
 
         Under SCREEN_SHARING_PERTILE_RECOVERY, a tile that wedged mid-stream and is
         still awaiting the re-root IDR also returns None — but only that
@@ -506,6 +508,7 @@ class HevcDecoder:
         slot = self._tiles[tile_idx]
         with slot.lock:
             frame = slot.raw_frame
+            reported_error = slot.had_decode_error
             count = slot.good_count
             already_evaluated = count <= slot.last_evaluated_count
 
@@ -520,12 +523,13 @@ class HevcDecoder:
 
         if tile_frame is None:
             return None
-        # libavcodec flagged this frame as concealed / corrupt — fire
-        # FIR immediately so the next IDR closes the failure window.
-        # The frame is still published so the operator sees the
-        # transient artifact rather than a frozen tile.
-        if had_decode_error:
+        # Leave the existing GPU texture in place while recovery runs.
+        # Log-only HEVC reference errors need the same treatment as PyAV's
+        # public is_corrupt flag: neither may reach the renderer as gray fill.
+        if had_decode_error or reported_error:
             self._gate.mark_decode_error(tile_idx)
+            log.debug("holding corrupt decoded frame for tile %d", tile_idx)
+            return None
         else:
             # Clean frame → reset the per-tile bad_streak so a
             # transient burst of decode errors doesn't accumulate
@@ -601,6 +605,22 @@ class HevcDecoder:
         self._teardown()
 
     # -- internals: decode --------------------------------------------
+
+    def mark_decode_concealment(self, trigger: str = "") -> None:
+        """Attribute a synchronous libav reference error to the submitted AU.
+
+        Some HEVC concealment produces frames with is_corrupt=False. The
+        session's log callback supplies that missing signal. Keep the PTS
+        until output arrives, so buffered frames retain their own error state.
+        This callback must not acquire _codec_lock, already held by decode().
+        """
+        pts = self._decoding_pts
+        if pts is None:
+            return
+        self._concealed_pts.add(pts)
+        ti = self._pts_to_tile.get(pts)
+        if ti is not None:
+            self._gate.mark_decode_error(ti, reliable=False)
 
     def _decode_one(self, nalu: bytes, tile_idx: int) -> None:
         """Wrap one NALU in an `av.Packet`, attach a fresh PTS, run through
@@ -705,6 +725,7 @@ class HevcDecoder:
             cutoff = pts - _PTS_MAP_PRUNE_KEEP
             self._pts_to_tile = {k: v for k, v in self._pts_to_tile.items() if k > cutoff}
             self._pts_submit_t = {k: v for k, v in self._pts_submit_t.items() if k > cutoff}
+            self._concealed_pts.intersection_update(self._pts_to_tile)
 
         try:
             with self._codec_lock:
@@ -713,7 +734,11 @@ class HevcDecoder:
                 # got the lock.
                 if self._codec is None:
                     return
-                frames = self._codec.decode(pkt)
+                self._decoding_pts = pts
+                try:
+                    frames = self._codec.decode(pkt)
+                finally:
+                    self._decoding_pts = None
             published = False
             for frame in frames:
                 self._publish_frame(frame)
@@ -741,18 +766,16 @@ class HevcDecoder:
 
     def _publish_frame(self, frame: av.VideoFrame) -> None:
         """Map `frame.pts` back to its source tile and update that slot."""
-        # One-time HW-binding truthfulness check: if we requested a hwaccel
-        # but the output is a software pixel format, the accel never bound
-        # (e.g. D3D11VA on a 4:4:4 stream) — relabel as software so the
-        # profile log / `hw_accel` are honest and downstream stops assuming
-        # a GPU surface. The decode itself is unaffected; only the label.
+        # PyAV normally downloads HW frames into CPU planes. Check the codec
+        # context rather than mislabelling successful HW output as software.
         if not self._hw_verified:
             self._hw_verified = True
             if (self._hw_name is not None
-                    and frame.format.name not in _HW_FRAME_FORMATS):
+                    and not getattr(self._codec, "is_hwaccel",
+                                    frame.format.name in _HW_FRAME_FORMATS)):
                 log.warning(
-                    "hwaccel %r did not bind for this stream (output=%s); "
-                    "decoding in software", self._hw_name, frame.format.name,
+                    "hwaccel %r did not bind for this stream; "
+                    "decoding in software", self._hw_name,
                 )
                 self._hw_name = None
 
@@ -772,13 +795,16 @@ class HevcDecoder:
         # them in good_count (throughput) but NOT clean_count (real video),
         # so the profile can distinguish a healthy tile from a gray one that
         # is still churning concealed frames at full rate.
-        err = getattr(frame, "decode_error_flags", 0)
-        flg = getattr(frame, "flags", 0)
-        had_error = bool(err) or bool(flg & 0x01)
+        had_error = (
+            _frame_has_decode_error(frame)
+            or frame.pts in self._concealed_pts
+        )
+        self._concealed_pts.discard(frame.pts)
 
         slot = self._tiles[ti]
         with slot.lock:
             slot.raw_frame = frame
+            slot.had_decode_error = had_error
             slot.good_count += 1
             if not had_error:
                 slot.clean_count += 1
@@ -1079,14 +1105,16 @@ class HevcDecoder:
         # _try_hwaccel labels the context with the REQUESTED hwaccel, but the
         # accel only binds in get_format. e.g. DXVA2/D3D11VA are never offered
         # for HEVC 4:4:4, so on Windows Apple's stream silently decodes in
-        # software through a context still labelled "d3d11va". Re-verify from
-        # the first real frame's pixel format (see _publish_frame).
+        # software through a context still labelled "d3d11va". Re-verify the
+        # context's is_hwaccel after real decoding (see _publish_frame).
         self._hw_verified = False
         self._reformatter[0] = None
         self._seen_fmts.clear()
         self._next_pts = 0
         self._pts_to_tile = {}
         self._pts_submit_t = {}
+        self._decoding_pts = None
+        self._concealed_pts.clear()
         self._decode_latency_ms = 0.0
         log.info("HEVC decoder: shared context (%s)", hw_name or "software")
         # NALU dump diagnostic: prepend VPS+SPS+all-PPSes (Annex-B) so a
@@ -1147,6 +1175,7 @@ class HevcDecoder:
         for slot in self._tiles:
             with slot.lock:
                 slot.raw_frame = None
+                slot.had_decode_error = False
                 slot.good_count = 0
                 slot.clean_count = 0
                 slot.last_evaluated_count = 0
@@ -1157,6 +1186,8 @@ class HevcDecoder:
         self._next_pts = 0
         self._pts_to_tile = {}
         self._pts_submit_t = {}
+        self._decoding_pts = None
+        self._concealed_pts.clear()
         self._decode_latency_ms = 0.0
         self._dpb_has_idr = False
         self._tiles_await_idr.clear()

@@ -86,6 +86,8 @@ class _TileSlot:
     the decode worker (writer) and the consumer's `get_frame()` (reader)
     don't tear."""
     raw_frame: Optional[av.VideoFrame] = None
+    # Includes libav log-only concealment, which PyAV may not flag on the frame.
+    had_decode_error: bool = False
     good_count: int = 0
     # Frames published WITHOUT a libav decode-error flag — i.e. actually
     # clean video, not concealed gray. `good_count` counts every published
@@ -122,6 +124,15 @@ _HW_FRAME_FORMATS = frozenset({
 _PACKED_444_FORMATS = frozenset({"vuyx", "vuya", "ayuv", "uyva", "xyuv"})
 
 
+def _frame_has_decode_error(frame: av.VideoFrame) -> bool:
+    """Read PyAV's public corruption flag, plus flags exposed by older wrappers."""
+    return (
+        bool(getattr(frame, "is_corrupt", False))
+        or bool(getattr(frame, "decode_error_flags", 0))
+        or bool(getattr(frame, "flags", 0) & 0x01)
+    )
+
+
 def _av_frame_to_tile(
     frame: av.VideoFrame,
     reformatter_holder: list[Optional[av.video.reformatter.VideoReformatter]],
@@ -130,16 +141,12 @@ def _av_frame_to_tile(
     """Convert an `av.VideoFrame` to our `TileFrame`.
 
     Returns `(tile, had_decode_error)`. `had_decode_error` is True when
-    libavcodec set `decode_error_flags` or marked the frame corrupt —
+    PyAV marks the frame corrupt or libavcodec exposes decode errors —
     the cheapest signal we have for "the decoder concealed missing
-    reference data". The tile is still returned (publish-it-anyway
-    policy: a momentary visible artifact + a fast FIR is more useful
-    to the operator than a frozen tile)."""
-    err = getattr(frame, "decode_error_flags", 0)
-    flg = getattr(frame, "flags", 0)
-    had_error = bool(err) or bool(flg & 0x01)
+    reference data". Callers must hold the previous picture on error."""
+    had_error = _frame_has_decode_error(frame)
     if had_error:
-        log.debug("decode error: decode_error_flags=%d flags=0x%x", err, flg)
+        log.debug("decoded frame is corrupt")
     fmt = frame.format.name
     width = frame.width
     height = frame.height
@@ -217,4 +224,5 @@ __all__ = [
     "_TileSlot",
     "_HW_FRAME_FORMATS",
     "_av_frame_to_tile",
+    "_frame_has_decode_error",
 ]

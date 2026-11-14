@@ -499,6 +499,7 @@ class QsvHevcDecoder:
             slot.last_evaluated_count = count
         if had_err:
             self._gate.mark_decode_error(tile_idx)
+            return None
         else:
             self._gate.mark_clean(tile_idx)
         if not self._gate.should_publish(tile_idx, tile_frame):  # type: ignore[arg-type]

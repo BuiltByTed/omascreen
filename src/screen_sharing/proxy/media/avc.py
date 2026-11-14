@@ -321,6 +321,9 @@ class AvcDecoder:
             c.flags = _CODEC_FLAG_LOW_DELAY
             c.flags2 = _CODEC_FLAG2_FAST
             c.open()
+            if getattr(c, "is_hwaccel", None) is False:
+                log.info("AVC hwaccel %s was not initialized; using software", hw_type)
+                return None
             return c
         except Exception as e:
             log.info("AVC hwaccel %s unavailable: %s", hw_type, e)
@@ -551,6 +554,7 @@ class AvcDecoder:
             return None
         if had_error:
             self._gate.mark_decode_error(tile_idx)
+            return None
         else:
             self._gate.mark_clean(tile_idx)
             with slot.lock:

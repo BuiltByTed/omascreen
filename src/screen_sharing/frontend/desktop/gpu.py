@@ -462,6 +462,12 @@ class Renderer:
         encoder padding past `canvas_h`) are dropped from the display.
         """
         w = tile.width
+        # The session can change geometry between the viewer's canvas check
+        # and get_frame(). Keep the previous picture until its next canvas
+        # rebuild instead of submitting an out-of-bounds GPU texture write.
+        if w > self._w or tile.chroma_width > self._w:
+            log.debug("holding %dpx tile while %dpx canvas catches up", w, self._w)
+            return
         origin_y = tile_index * slot_height
         remaining = max(0, self._h - origin_y)
         rows = min(tile.height, slot_height, remaining)

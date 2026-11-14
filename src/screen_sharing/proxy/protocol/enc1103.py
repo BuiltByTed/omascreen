@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import socket
 import struct
 import threading
 from typing import Optional
@@ -67,11 +68,14 @@ class StreamCipher:
         self._dec = AES.new(cbc_key, AES.MODE_CBC, iv=cbc_iv)
         self._enc_ctr = 0
         self._dec_ctr = 0
+        self._send_failed = False
         self._lock = threading.Lock()
 
     def _encrypt_locked(self, plaintext: bytes) -> bytes:
         """Encrypt one record. Caller MUST hold `self._lock` — the record
         counter increment and the returned bytes must stay paired."""
+        if self._send_failed:
+            raise ConnectionError("Encrypted control stream failed; reconnect required")
         counter = self._enc_ctr
         pad = (-(2 + len(plaintext) + _MAC_LEN)) % _BLOCK
         framed = struct.pack(">H", len(plaintext)) + plaintext + b"\x00" * pad
@@ -98,7 +102,19 @@ class StreamCipher:
         Holding the lock across both keeps counter order == wire order."""
         with self._lock:
             enc = self._encrypt_locked(plaintext)
-            sock.sendall(enc)
+            try:
+                sock.sendall(enc)
+            except OSError:
+                # sendall may have written only part of this CBC record. We
+                # cannot retry or continue: both framing and cipher state may
+                # now differ from the peer. Wake the TCP receiver so its normal
+                # disconnect/reconnect path runs, even while UDP is healthy.
+                self._send_failed = True
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                raise
 
     def decrypt_message(self, ciphertext: bytes) -> Optional[bytes]:
         """Decrypt one ciphertext block. Returns the inner RFB body, or None

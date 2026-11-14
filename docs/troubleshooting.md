@@ -42,11 +42,29 @@ Both AVC and HEVC now give retransmitted RTP packets a short reordering window
 before feeding an access unit to the decoder. Unrecoverable gaps break the
 reference chain and request a fresh keyframe. Lost recovery keyframes are retried
 even while the remote screen is static, subject to the existing rate limit.
+Corrupt decoded frames are held back so recovery leaves the last good picture
+on screen. Both PyAV's `is_corrupt` flag and HEVC reference errors reported only
+through libav logs are checked; some HEVC concealment does not set a frame flag.
+Startup packets also wait for repair if a sequence gap is present, including
+when the 16-bit sequence counter wraps; retransmissions are decoded only once.
+
+Automatic codec selection verifies that PyAV created a hardware decoder before
+offering HEVC 4:4:4. A software-decoded probe frame does not demonstrate hardware
+support. Machines without working HEVC 4:4:4 acceleration use AVC automatically;
+an explicit codec selection still takes precedence.
 
 If corruption persists, note whether it happens with HEVC or AVC and whether
 reconnecting clears it. Try `omascreen edit NAME --codec avc` (or `hevc`) and
 collect local diagnostics by launching the connection from a terminal. Do not
 share capture keys, passwords, or private clipboard data in bug reports.
+
+## Multiple Mac connections
+
+Each session associates its UDP media sockets with its Mac's address and port.
+This lets different Macs use the required local media ports simultaneously
+without a newly opened viewer taking another viewer's packets. If an older
+viewer freezes when a second connection opens, close and reopen both viewers
+after updating Omascreen.
 
 ## Missing icons or detection
 

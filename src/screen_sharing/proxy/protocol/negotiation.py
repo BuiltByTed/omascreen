@@ -825,67 +825,71 @@ def connect_and_negotiate(
 def _read_until_enc1103(
     sock: socket.socket, ecb_key: bytes, *, first_byte_timeout: float = 10.0,
 ) -> StreamCipher:
-    """Buffer recv until we see a 1103 encoding entry, then construct a
-    `StreamCipher` from its 36-byte body. Tolerates 0x14 UserSessionChanged
-    notifications that can interleave with the ServerInit reply burst.
+    """Read complete plaintext updates until one advertises encoding 1103.
+
+    Read only each update's declared bytes so a pipelined encrypted record
+    stays on the socket for the post-toggle drain. Return as soon as the
+    complete update arrives, rather than waiting for a one-second idle gap.
+    Tolerates 0x14 UserSessionChanged notifications and fragmented TCP reads.
 
     The default `first_byte_timeout` of 10 s covers a normal handshake.
     Share-console / alt-session flows wait for the SessionSelect prompt
     earlier in `_phase_session_select`, so by the time we get here the
     connection is already past any human-confirm gate.
     """
-    sock.settimeout(1.0)
-    init = bytearray()
     deadline = time.monotonic() + first_byte_timeout
-    while time.monotonic() < deadline:
-        try:
-            chunk = sock.recv(65536)
+
+    def read_exact(size: int) -> bytes:
+        data = bytearray()
+        while len(data) < size:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("enc1103 negotiation deadline expired")
+            sock.settimeout(min(1.0, remaining))
+            try:
+                chunk = sock.recv(size - len(data))
+            except socket.timeout:
+                continue
             if not chunk:
-                break
-            init += chunk
-        except socket.timeout:
-            if init:
-                break
-    sock.settimeout(15)
+                raise EOFError("Mac closed the connection before enc1103")
+            data += chunk
+        return bytes(data)
 
-    pos = 0
-    cipher: Optional[StreamCipher] = None
-    while pos < len(init):
-        b = init[pos]
-        if b == 0x14 and pos + 8 <= len(init):
-            pos += 8
-            continue
-        if b == 0x00 and pos + 4 <= len(init):
-            n_rects = struct.unpack(">H", init[pos + 2:pos + 4])[0]
-            p = pos + 4
+    try:
+        while time.monotonic() < deadline:
+            kind = read_exact(1)[0]
+            if kind == 0x14:
+                read_exact(7)
+                continue
+            if kind != 0x00:
+                break
+            header = read_exact(3)  # padding + rectangle count
+            n_rects = struct.unpack(">H", header[1:3])[0]
+            key_blob: Optional[bytes] = None
             for _ in range(n_rects):
-                if p + 12 > len(init):
-                    break
-                enc = struct.unpack(">i", init[p + 8:p + 12])[0]
-                p += 12
-                if enc == 1103 and p + 36 <= len(init):
-                    cipher = StreamCipher(bytes(init[p:p + 36]), ecb_key=ecb_key)
-                    p += 36
-                elif enc in (1010, 1011) and p + 2 <= len(init):
-                    sz = struct.unpack(">H", init[p:p + 2])[0]
-                    p += 2 + sz
+                rectangle = read_exact(12)
+                encoding = struct.unpack(">i", rectangle[8:12])[0]
+                if encoding == 1103:
+                    key_blob = read_exact(36)
+                elif encoding in (1010, 1011):
+                    length = struct.unpack(">H", read_exact(2))[0]
+                    read_exact(length)
                 else:
-                    break
-            pos = p
-            break
-        break
+                    raise ValueError("unexpected encoding before enc1103")
+            if key_blob is not None:
+                cipher = StreamCipher(key_blob, ecb_key=ecb_key)
+                log.info("enc1103 OK")
+                return cipher
+    except (TimeoutError, EOFError, ValueError):
+        pass
+    finally:
+        sock.settimeout(15)
 
-    if cipher is None:
-        sock.close()
-        raise RuntimeError(
-            "server did not advertise enc1103. Most often this is rate-limiting "
-            "on the server — wait 10-15 seconds and retry."
-        )
-    log.info("enc1103 OK")
-
-    if pos < len(init):
-        cipher.decrypt_stream(bytes(init[pos:]))  # discard tail; we only want the side-effect of advancing the recv counter
-    return cipher
+    sock.close()
+    raise RuntimeError(
+        "server did not advertise enc1103. Most often this is rate-limiting "
+        "on the server — wait 10-15 seconds and retry."
+    )
 
 
 def _drain_through_cipher(

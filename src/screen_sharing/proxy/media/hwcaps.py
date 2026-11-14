@@ -46,11 +46,11 @@ _cache: dict[str, bool] = {}
 def _probe_one(hwaccel_type: str) -> bool:
     """True iff `hwaccel_type` hardware-decodes the embedded HEVC 4:4:4 sample.
 
-    Uses `allow_software_fallback=False` so libav will NOT silently decode in
-    software when the GPU lacks the profile: a produced frame then means the
-    GPU did it, while an unsupported profile yields no frame / an exception.
-    (Inspecting `frame.format` is unreliable — VideoToolbox hands back a normal
-    `nv24`/`nv12` frame even on a true hardware decode.)"""
+    Require an actual hardware context as well as a frame. PyAV can ignore an
+    unsupported HWAccel configuration entirely and create a software decoder,
+    even with allow_software_fallback=False. Frame pixel formats cannot tell
+    us: PyAV normally downloads successful hardware output to CPU planes.
+    """
     try:
         import av
         from av.codec.hwaccel import HWAccel
@@ -66,9 +66,9 @@ def _probe_one(hwaccel_type: str) -> bool:
         ctx = av.CodecContext.create("hevc", "r", hwaccel=hw)
         frames = list(ctx.decode(av.Packet(_HEVC444_SAMPLE)))
         frames += list(ctx.decode(None))  # flush
-        ok = bool(frames)
+        ok = bool(frames) and bool(getattr(ctx, "is_hwaccel", False))
         log.info("hevc444 probe (%s): %s%s", hwaccel_type,
-                 "HW-decoded" if ok else "no HW frame",
+                 "HW-decoded" if ok else "no hardware decode",
                  (" (fmt=%s)" % frames[0].format.name) if frames else "")
         return ok
     except Exception as e:
